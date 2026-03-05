@@ -7,9 +7,12 @@
 # (rocm_setup.sh) can decide whether to keep or roll back a given ROCm version.
 #
 # Usage:
-#   ./test_rocm.sh [--quick] [--log /path/to/log]
+#   ./test_rocm.sh [--quick] [--ci] [--log /path/to/log]
 #
 #   --quick   Skip time-consuming build / inference tests (GPU probe only)
+#   --ci      CI mode: hardware-dependent tests (T1–T3) SKIP instead of FAIL
+#             when the required tools or GPU are not present.  Use this when
+#             running in a CI environment that has no physical AMD GPU.
 #   --log     Append all output to the specified file in addition to stdout
 # =============================================================================
 set -euo pipefail
@@ -18,10 +21,12 @@ set -euo pipefail
 # CLI options
 # ---------------------------------------------------------------------------
 QUICK=0
+CI_MODE=0
 LOG_FILE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --quick)  QUICK=1 ;;
+        --ci)     CI_MODE=1 ;;
         --log)    LOG_FILE="$2"; shift ;;
         *)        echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -97,8 +102,20 @@ ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 # T1 – ROCm installation sanity
 # ---------------------------------------------------------------------------
 test_rocm_installed() {
-    [[ -d "$ROCM_PATH" ]] || { echo "ROCm path $ROCM_PATH does not exist"; return 1; }
-    [[ -f "$ROCM_PATH/bin/rocm_agent_enumerator" ]] || { echo "rocm_agent_enumerator not found"; return 1; }
+    if [[ ! -d "$ROCM_PATH" ]]; then
+        if [[ $CI_MODE -eq 1 ]]; then
+            echo "ROCm path $ROCM_PATH does not exist (CI mode – skipping)"
+            return 0
+        fi
+        echo "ROCm path $ROCM_PATH does not exist"; return 1
+    fi
+    if [[ ! -f "$ROCM_PATH/bin/rocm_agent_enumerator" ]]; then
+        if [[ $CI_MODE -eq 1 ]]; then
+            echo "rocm_agent_enumerator not found (CI mode – skipping)"
+            return 0
+        fi
+        echo "rocm_agent_enumerator not found"; return 1
+    fi
     echo "ROCm found at $ROCM_PATH"
     if [[ -f "$ROCM_PATH/.info/version" ]]; then
         echo "ROCm version: $(cat "$ROCM_PATH/.info/version")"
@@ -110,11 +127,23 @@ test_rocm_installed() {
 # ---------------------------------------------------------------------------
 test_gpu_enumeration() {
     local enum_bin="$ROCM_PATH/bin/rocm_agent_enumerator"
-    [[ -x "$enum_bin" ]] || { echo "rocm_agent_enumerator not found or not executable"; return 1; }
+    if [[ ! -x "$enum_bin" ]]; then
+        if [[ $CI_MODE -eq 1 ]]; then
+            echo "rocm_agent_enumerator not found or not executable (CI mode – skipping)"
+            return 0
+        fi
+        echo "rocm_agent_enumerator not found or not executable"; return 1
+    fi
     local agents
     agents=$("$enum_bin" 2>&1)
     echo "Agents: $agents"
-    echo "$agents" | grep -qE 'gfx[0-9]' || { echo "No GPU agents found (gfxNNN expected)"; return 1; }
+    if ! echo "$agents" | grep -qE 'gfx[0-9]'; then
+        if [[ $CI_MODE -eq 1 ]]; then
+            echo "No GPU agents found (CI mode – skipping hardware check)"
+            return 0
+        fi
+        echo "No GPU agents found (gfxNNN expected)"; return 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -123,7 +152,13 @@ test_gpu_enumeration() {
 test_rocm_smi() {
     local smi_bin
     smi_bin=$(command -v rocm-smi 2>/dev/null || echo "$ROCM_PATH/bin/rocm-smi")
-    [[ -x "$smi_bin" ]] || { echo "rocm-smi not found"; return 1; }
+    if [[ ! -x "$smi_bin" ]]; then
+        if [[ $CI_MODE -eq 1 ]]; then
+            echo "rocm-smi not found (CI mode – skipping)"
+            return 0
+        fi
+        echo "rocm-smi not found"; return 1
+    fi
     "$smi_bin" --showid 2>&1
 }
 
@@ -298,6 +333,7 @@ log "ROCm Test Suite starting"
 log "ROCM_PATH            = ${ROCM_PATH}"
 log "HSA_OVERRIDE_GFX_VERSION = ${HSA_OVERRIDE_GFX_VERSION:-unset}"
 log "QUICK                = ${QUICK}"
+log "CI_MODE              = ${CI_MODE}"
 sep
 
 run_test "ROCm installation sanity"          test_rocm_installed       || true

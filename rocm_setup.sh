@@ -369,20 +369,31 @@ install_rocm_via_repo() {
 # ---------------------------------------------------------------------------
 install_rocm_direct() {
     local version="$1"
+    local codename="${2:-noble}"   # Ubuntu codename from the version catalogue
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
-    log "Attempting direct .deb download for ROCm ${version}"
+    log "Attempting direct .deb download for ROCm ${version} (${codename})"
 
-    # AMD provides a .deb bundle installer for some versions.
+    # AMD provides a .deb bundle installer for each release.
     # The installer filename follows the pattern:
-    #   amdgpu-install_<MAJOR>.<MINOR>.<PATCH>.50<MAJOR><MINOR><PATCH>-1_all.deb
-    # e.g. ROCm 6.2.4 → amdgpu-install_6.2.4.60204-1_all.deb
-    # The ".50" infix is AMD's build-number prefix; it is constant across versions.
-    local major_minor
-    major_minor=$(echo "$version" | cut -d. -f1,2)
-    local ver_nodot="${version//./}"   # e.g. "624" from "6.2.4"
-    local amdgpu_installer_url="https://repo.radeon.com/amdgpu-install/${version}/ubuntu/noble/amdgpu-install_${version}.50${ver_nodot}-1_all.deb"
+    #   amdgpu-install_<MAJOR>.<MINOR>.<BUILDNUM>-1_all.deb
+    # where BUILDNUM = MAJOR * 10000 + MINOR * 100 + PATCH  (each component
+    # zero-padded to 2 digits for MINOR and PATCH).
+    # Examples:
+    #   ROCm 6.3.1  →  amdgpu-install_6.3.60301-1_all.deb
+    #   ROCm 6.2.4  →  amdgpu-install_6.2.60204-1_all.deb
+    #   ROCm 5.7.3  →  amdgpu-install_5.7.50703-1_all.deb
+    local major minor patch build_num pkg_name
+    major=$(echo "$version" | cut -d. -f1)
+    minor=$(echo "$version" | cut -d. -f2)
+    patch=$(echo "$version" | cut -d. -f3)
+    # %d for major (AMD major versions are single-digit; no zero-padding required).
+    # %02d for minor and patch to ensure correct two-digit encoding in the build number.
+    printf -v build_num '%d%02d%02d' "$major" "$minor" "$patch"
+    pkg_name="amdgpu-install_${major}.${minor}.${build_num}-1_all.deb"
+
+    local amdgpu_installer_url="https://repo.radeon.com/amdgpu-install/${version}/ubuntu/${codename}/${pkg_name}"
 
     if [[ $OPT_DRY_RUN -eq 1 ]]; then
         log "[dry-run] would download: $amdgpu_installer_url"
@@ -390,21 +401,38 @@ install_rocm_direct() {
         return 0
     fi
 
+    # Try primary codename first; fall back to the other common codename if it fails.
+    local fallback_codename
+    [[ "$codename" == "noble" ]] && fallback_codename="jammy" || fallback_codename="noble"
+    local fallback_url="https://repo.radeon.com/amdgpu-install/${version}/ubuntu/${fallback_codename}/${pkg_name}"
+
+    local download_ok=0
     if curl -fsSL -o "${tmp_dir}/amdgpu-install.deb" "$amdgpu_installer_url" 2>/dev/null; then
-        ok "Downloaded amdgpu-install .deb"
+        download_ok=1
+    elif curl -fsSL -o "${tmp_dir}/amdgpu-install.deb" "$fallback_url" 2>/dev/null; then
+        warn "Primary codename (${codename}) not found; used fallback (${fallback_codename})"
+        download_ok=1
+    fi
+
+    if [[ $download_ok -eq 1 ]]; then
+        ok "Downloaded ${pkg_name}"
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             "${tmp_dir}/amdgpu-install.deb" 2>&1 | tail -5
-        # Now use the installer
+        # Install ROCm via the downloaded wrapper
         DEBIAN_FRONTEND=noninteractive amdgpu-install --rocmrelease="${version}" \
             --usecase=rocm,hip,opencl \
             --no-dkms \
             --accept-eula \
             2>&1 | tee "${OPT_LOG_DIR}/amdgpu_install_${version}.log" | tail -20
         ok "ROCm ${version} installed via amdgpu-install"
+        # Remove the amdgpu-install meta-package – it is only needed for the
+        # initial bootstrap; the actual ROCm packages are managed separately.
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge amdgpu-install \
+            2>/dev/null || true
         rm -rf "$tmp_dir"
         return 0
     else
-        warn "Direct download failed for ${version}"
+        warn "Direct download failed for ${version} (tried ${codename} and ${fallback_codename})"
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -565,8 +593,8 @@ main() {
     [[ -z "$OPT_START_VERSION" ]] && reached_start=1
 
     for ver_entry in "${ROCM_VERSIONS[@]}"; do
-        local version codename method
-        IFS='|' read -r version codename method <<< "$ver_entry"
+        local version orig_codename repo_codename method
+        IFS='|' read -r version orig_codename method <<< "$ver_entry"
 
         # --start-version filter
         if [[ $reached_start -eq 0 ]]; then
@@ -579,11 +607,16 @@ main() {
             fi
         fi
 
-        # Ubuntu codename compatibility check
+        # Ubuntu codename compatibility:
+        # - orig_codename is from the catalogue and is used for direct .deb downloads
+        #   (it matches what AMD actually published for that release).
+        # - repo_codename may be adjusted for the APT repo path when running on a
+        #   newer Ubuntu (e.g. noble can sometimes pull jammy repo packages).
+        repo_codename="$orig_codename"
         local sys_codename="${OS_CODENAME:-noble}"
-        if [[ "$codename" == "jammy" && "$sys_codename" == "noble" ]]; then
-            # Ubuntu 24.04 can run jammy packages in some cases – attempt anyway
-            codename="noble"
+        if [[ "$orig_codename" == "jammy" && "$sys_codename" == "noble" ]]; then
+            # Ubuntu 24.04: try the noble APT repo path first; fall back to jammy
+            repo_codename="noble"
         fi
 
         header "ROCm ${version} (${method})"
@@ -591,16 +624,16 @@ main() {
         # --- Install ---
         local install_ok=0
         if [[ "$method" == "repo" ]]; then
-            if install_rocm_via_repo "$version" "$codename"; then
+            if install_rocm_via_repo "$version" "$repo_codename"; then
                 install_ok=1
             else
                 warn "Repo install failed – trying direct download"
-                if install_rocm_direct "$version"; then
+                if install_rocm_direct "$version" "$orig_codename"; then
                     install_ok=1
                 fi
             fi
         else
-            if install_rocm_direct "$version"; then
+            if install_rocm_direct "$version" "$orig_codename"; then
                 install_ok=1
             fi
         fi
@@ -643,7 +676,7 @@ main() {
         if [[ -n "$best_entry" ]]; then
             local bver bcode _bmethod
             IFS='|' read -r bver bcode _bmethod <<< "$best_entry"
-            install_rocm_via_repo "$bver" "$bcode" || install_rocm_direct "$bver" || true
+            install_rocm_via_repo "$bver" "$bcode" || install_rocm_direct "$bver" "$bcode" || true
             configure_environment "$bver"
         fi
     fi
