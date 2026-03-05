@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint-and-test:
+    name: Lint & Independent Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x rocm_setup.sh test_rocm.sh rocm_env.sh rocm_report.sh
+
+      - name: Check shell script syntax
+        run: |
+          bash -n rocm_setup.sh
+          bash -n test_rocm.sh
+          bash -n rocm_env.sh
+          bash -n rocm_report.sh
+          echo "All scripts pass syntax check."
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: ShellCheck – rocm_setup.sh
+        run: shellcheck -S warning rocm_setup.sh
+
+      - name: ShellCheck – test_rocm.sh
+        run: shellcheck -S warning test_rocm.sh
+
+      - name: ShellCheck – rocm_env.sh
+        run: shellcheck -S warning rocm_env.sh
+
+      - name: ShellCheck – rocm_report.sh
+        run: shellcheck -S warning rocm_report.sh
+
+      - name: Run test suite in CI mode
+        # --ci: hardware tests (T1–T3) skip gracefully when no AMD GPU is present.
+        # --quick: skip compile/inference tests (no ROCm toolchain installed).
+        # The suite should exit 0 (all tests pass or skip) in a stock runner.
+        run: bash test_rocm.sh --ci --quick

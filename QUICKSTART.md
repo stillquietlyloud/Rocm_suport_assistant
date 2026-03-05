@@ -98,6 +98,18 @@ GPU  Temp   AvgPwr  SCLK    MCLK    Fan     Perf    PwrCap  VRAM%  GPU%
 
 ---
 
+## Step 6b – Verify without GPU hardware (CI/testing)
+
+If you want to run the test suite on a machine without an AMD GPU (e.g. for script validation in CI), use `--ci` mode. Hardware-dependent tests skip gracefully instead of failing:
+
+```bash
+bash test_rocm.sh --ci --quick
+```
+
+All 10 tests should report PASS (hardware tests report "CI mode – skipping").
+
+---
+
 ## Step 7 – Install AI workloads
 
 ### PyTorch (ROCm wheel)
@@ -145,6 +157,7 @@ tts --text "Hello from the MI50!" \
 |---|---|
 | `torch.cuda.is_available()` → False | `source /etc/profile.d/rocm_env.sh` and check `/dev/kfd` |
 | APT 404 errors | Script auto-falls back to direct download; check logs |
+| Direct download fails | Verify the URL format: `amdgpu-install_<major>.<minor>.<buildnum>-1_all.deb` where `buildnum = major * 10000 + minor * 100 + patch` (e.g. `6.3.1` → `amdgpu-install_6.3.60301-1_all.deb`) |
 | `HSA_STATUS_ERROR_INVALID_ISA` | `export HSA_OVERRIDE_GFX_VERSION=9.0.6` |
 | OOM with large models | Reduce context / use Q4_K_S quantization |
 | Container can't see GPU | Re-check Proxmox LXC config (Step 3) |

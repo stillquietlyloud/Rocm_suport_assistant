@@ -30,9 +30,12 @@ This project solves a common problem: AMD discontinued official ROCm support for
 - Detect your GPU and Ubuntu version automatically.
 - Iterate through ROCm versions (5.2 → latest) **from oldest to newest**.
 - Install each version, run a functional test suite, then **keep it if tests pass or roll it back if they fail**.
-- Fall back to direct `.deb` binary downloads when the AMD APT repository is unreachable.
+- Use direct `.deb` binary downloads from AMD (`repo.radeon.com/amdgpu-install/`) as the primary fallback when the AMD APT repository is unreachable – this method is the most reliable across ROCm releases.
 - Emit structured logs and a final summary report so you always know exactly what happened.
 - Configure the system environment (groups, `ld.so`, `profile.d`) so that **llama.cpp, Stable Diffusion, Coqui TTS, PyTorch, and other GPU workloads** work out of the box.
+- Clean up installer meta-packages after use – only the ROCm runtime libraries remain on the system.
+
+A CI pipeline (`.github/workflows/ci.yml`) validates all scripts on every push without requiring AMD GPU hardware, using the `--ci` mode of `test_rocm.sh`.
 
 ---
 
@@ -92,6 +95,9 @@ The script works identically on:
 
 ```
 Rocm_suport_assistant/
+├── .github/
+│   └── workflows/
+│       └── ci.yml         # CI pipeline: lint + ShellCheck + CI-mode tests
 ├── rocm_setup.sh      # Main installer / version-iterator script
 ├── test_rocm.sh       # Functional test suite
 ├── rocm_env.sh        # Environment variable definitions
@@ -152,10 +158,32 @@ Exit 0 (success) or 1 (no working version found)
 
 | Failure type | Action |
 |---|---|
-| APT repo unreachable | Fall back to direct `.deb` download |
+| APT repo unreachable | Fall back to direct `.deb` download (preferred method) |
 | Package install failure | Skip version, try next |
 | Test suite failure | Remove installed packages, try next version |
 | No passing version found | Exit 1 with full log path |
+
+### Direct `.deb` download URL format
+
+AMD hosts `amdgpu-install` bootstrap packages at:
+
+```
+https://repo.radeon.com/amdgpu-install/<version>/ubuntu/<codename>/<package>
+```
+
+where `<package>` follows the pattern `amdgpu-install_<major>.<minor>.<buildnum>-1_all.deb`
+and `<buildnum>` = `major * 10000 + minor * 100 + patch` (minor and patch are each
+zero-padded to two digits).  For example:
+
+| ROCm version | codename | package |
+|---|---|---|
+| 6.3.1 | noble | `amdgpu-install_6.3.60301-1_all.deb` |
+| 6.2.4 | noble | `amdgpu-install_6.2.60204-1_all.deb` |
+| 5.7.3 | jammy | `amdgpu-install_5.7.50703-1_all.deb` |
+| 5.6.1 | jammy | `amdgpu-install_5.6.50601-1_all.deb` |
+
+The `amdgpu-install` meta-package is automatically removed after ROCm is
+installed so that only the ROCm runtime libraries remain on the system.
 
 ---
 
@@ -262,6 +290,9 @@ sudo bash test_rocm.sh
 # Quick tests (GPU probe only)
 sudo bash test_rocm.sh --quick
 
+# CI mode – hardware tests (T1–T3) skip gracefully when no GPU is present
+bash test_rocm.sh --ci --quick
+
 # Append output to a log file
 sudo bash test_rocm.sh --log /tmp/my_rocm_test.log
 ```
@@ -270,9 +301,9 @@ Test IDs and what they check:
 
 | ID | Name | Notes |
 |---|---|---|
-| T1 | ROCm installation sanity | Checks `/opt/rocm` and version file |
-| T2 | GPU enumeration | `rocm_agent_enumerator` finds GPU |
-| T3 | rocm-smi | GPU details visible via SMI |
+| T1 | ROCm installation sanity | Checks `/opt/rocm` and version file; skips in `--ci` mode |
+| T2 | GPU enumeration | `rocm_agent_enumerator` finds GPU; skips in `--ci` mode |
+| T3 | rocm-smi | GPU details visible via SMI; skips in `--ci` mode |
 | T4 | OpenCL / clinfo | (skipped if clinfo not installed) |
 | T5 | HIP hello-world | Compiles and runs a small HIP kernel |
 | T6 | PyTorch GPU | `torch.cuda.is_available()` + matrix multiply |
@@ -282,6 +313,7 @@ Test IDs and what they check:
 | T10 | Memory bandwidth | `rocm-bandwidth-test` (if installed) |
 
 Tests T5–T10 are skipped in `--quick` mode.
+Tests T1–T3 return SKIP (not FAIL) in `--ci` mode when hardware is absent.
 
 ### `rocm_env.sh`
 
@@ -427,11 +459,16 @@ tts --text "Hello from your MI50!" \
 The AMD repo URL occasionally changes.  The script automatically falls back to direct `.deb` downloads.  If both fail:
 
 ```bash
-# Download the amdgpu-install meta-package manually
+# Download the amdgpu-install meta-package manually (example: ROCm 6.2.4 on noble)
 wget https://repo.radeon.com/amdgpu-install/6.2.4/ubuntu/noble/amdgpu-install_6.2.60204-1_all.deb
 sudo apt install ./amdgpu-install_6.2.60204-1_all.deb
 sudo amdgpu-install --usecase=rocm,hip,opencl --no-dkms --accept-eula
+# Remove the meta-package after installation (ROCm packages stay)
+sudo apt remove --purge amdgpu-install
 ```
+
+See the [Direct `.deb` download URL format](#direct-deb-download-url-format) section for the
+correct URL pattern for other ROCm versions.
 
 ### `HSA_STATUS_ERROR_INVALID_ISA` or kernel image errors with PyTorch
 
